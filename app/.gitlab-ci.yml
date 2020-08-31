@@ -1,0 +1,138 @@
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_HOST: tcp://localhost:2375
+
+services:
+  - docker:dind
+
+stages:
+  - test
+  - build
+  - deploy
+
+.common: &common |
+  set -eo pipefail
+
+    [[ "$TRACE" ]] && set -x
+
+    init_kube_config() {
+      echo "CI_ENVIRONMENT_NAME =  $CI_ENVIRONMENT_NAME"
+      if [ $CI_ENVIRONMENT_NAME == "production" ]; then
+        echo "set production host dns"
+        echo "$PRODUCTION_HOST $PRODUCTION_DOMAIN" > /etc/hosts
+        export KUBE_CONFIG=$KUBE_CONFIG_PRODUCTION
+      else
+        echo "set staging host dns"
+        echo "$STAGING_HOST $STAGING_DOMAIN" > /etc/hosts
+        export KUBE_CONFIG=$KUBE_CONFIG_STAGING
+      fi
+      cat /etc/hosts
+      mkdir -p $HOME/.kube
+      echo "initilize kube config"
+      echo ${KUBE_CONFIG} | base64 -d > $HOME/.kube/config
+    }
+
+    init_helm(){
+      echo "init helm"
+      helm ls
+      helm init --client-only
+      helm dependency update ./deployment
+      helm dependency build ./deployment
+    }
+
+    review_cluster() {
+      kubectl cluster-info
+      kubectl get pod -n ${KUBE_NAMESPACE}
+    }
+
+.init_kube: &init_kube |
+  init_kube_config
+  init_helm
+  review_cluster
+
+.registry: &registry |
+    login(){
+      echo "Logging to Gitlab Container Registry with CI credenticals..."
+      docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    }
+
+    build(){
+      docker build -t $CI_REGISTRY_IMAGE .
+      if [ $CI_ENVIRONMENT_NAME == "production" ]; then
+        export BUILD_TAG=$TAG; 
+      else
+       export BUILD_TAG=$CI_COMMIT_SHORT_SHA
+      fi
+      docker tag $CI_REGISTRY_IMAGE $CI_REGISTRY_IMAGE:$BUILD_TAG
+      echo "Pushing to Gitlab Container Registry..."
+      docker push $CI_REGISTRY_IMAGE:$BUILD_TAG
+    }
+
+.deploy: &deploy |
+    RELEASE_NAME="api-$CI_ENVIRONMENT_NAME"
+    echo "deploy $RELEASE_NAME to $CI_ENVIRONMENT_NAME environment"
+    helm upgrade $RELEASE_NAME ./deployment \
+      --install \
+      --values "deployment/$CI_ENVIRONMENT_NAME.yaml" \
+      --set image.tag=$CI_COMMIT_SHORT_SHA \
+      --namespace="$KUBE_NAMESPACE" \
+      --version="$CI_PIPELINE_ID-$CI_JOB_ID"
+
+eslint:
+  image: registry/sysad/docker/js-linter:master
+  stage: test
+  script:
+    - eslint .
+
+helm_test:
+  image: registry/sysad/docker/kube-tool:KUBE_VERSION
+  stage: test
+  script:
+    - helm lint --values "deployment/production.yaml" ./deployment
+    - helm lint --values "deployment/staging.yaml" ./deployment
+
+build_image:
+  stage: build
+  image: docker:latest
+  before_script:
+    - *registry
+  tags:
+    - main-docker
+  script:
+    - login
+    - build
+  only:
+    refs:
+      - master
+      - deploy/k8s
+
+staging_deploy:
+  image: registry/sysad/docker/kube-tool:KUBE_VERSION
+  stage: deploy
+  before_script:
+    - *common
+  script:
+    - *init_kube
+    - *deploy
+  environment:
+    name: staging
+  only:
+    refs:
+      - master
+      - deploy/k8s
+  when: manual
+
+production_deploy:
+  image: registry/sysad/docker/kube-tool:KUBE_VERSION
+  stage: deploy
+  before_script:
+    - *common
+  script:
+    - *init_kube
+    - *deploy
+  environment:
+    name: production
+  only:
+    refs:
+      - master
+  when: manual
